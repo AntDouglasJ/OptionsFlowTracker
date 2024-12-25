@@ -17,7 +17,11 @@ except ImportError:
 # PAGE CONFIG
 # --------------------------------------------------
 st.set_page_config(page_title="Flow & Stock Tracker", layout="wide")
-
+STREAMLIT_THEME_BASE="dark"
+STREAMLIT_PRIMARY_COLOR="#0386EC"
+STREAMLIT_BACKGROUND_COLOR="#0E1117"
+STREAMLIT_SECONDARY_BACKGROUND_COLOR="#262730"
+STREAMLIT_TEXT_COLOR="#FAFAFA"
 # --------------------------------------------------
 # GLOBALS / SESSION STATE
 # --------------------------------------------------
