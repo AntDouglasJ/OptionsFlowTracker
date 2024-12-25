@@ -365,6 +365,60 @@ def page_options_flow():
             disp.drop(columns=["Strike_str"], errors="ignore", inplace=True)
 
             st.dataframe(disp.reset_index(drop=True))
+            
+        st.subheader("Background Scheduler & Manual Snapshot")
+        st.write("DEBUG: Entered the Settings tab code.")
+
+        if st.button("Start Background Scheduler"):
+            start_scheduler()
+
+        if st.button("Fetch Snapshot Now"):
+            fetch_options_data.clear()
+            new_data = fetch_options_data(SYMBOLS, st.session_state.refresh_count)
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if new_data.empty:
+                st.warning("No data returned.")
+            else:
+                old_time = get_latest_snapshot_time()
+                old_df = pd.DataFrame([])
+                if old_time:
+                    old_df = get_snapshot_data(old_time)
+
+                store_snapshot(new_data, now_str)
+                st.success(f"Snapshot stored at {now_str}, total rows: {len(new_data)}")
+
+                # Check for unusual volume => alerts
+                alerts = handle_unusual_volume(new_data, old_df)
+                if alerts.empty:
+                    st.info("No unusual volume found.")
+                else:
+                    st.success(f"Detected {len(alerts)} unusual volume rows.")
+                    st.dataframe(alerts)
+
+        if st.button("Clear Cache"):
+            fetch_options_data.clear()
+            st.success("Options data cache cleared.")
+
+        st.write("---")
+        st.write("**Alert Settings**")
+        ratio_val = st.number_input("Volume Ratio Threshold (e.g. 2 = 2x)",
+                                    min_value=1.0, value=st.session_state.alert_ratio, step=0.5)
+        diff_val = st.number_input("Absolute Volume Increase Threshold",
+                                   min_value=1, value=st.session_state.alert_diff, step=100)
+
+        if st.button("Save Alert Settings"):
+            st.session_state.alert_ratio = ratio_val
+            st.session_state.alert_diff = diff_val
+            st.success(f"Saved ratio={ratio_val} diff={diff_val}")
+
+        st.write(f"**Current Ratio**: {st.session_state.alert_ratio}, "
+                 f"**Current Diff**: {st.session_state.alert_diff}")
+
+        st.write("---")
+        st.write(f"**Refresh Count (session)**: {st.session_state.refresh_count}")
+        if st.session_state.scheduler_running:
+            st.info("Background scheduler is running in a separate thread.")
 
     # ---- Tab2: Alert History
     with tab2:
@@ -378,6 +432,7 @@ def page_options_flow():
     # ---- Tab3: Settings (combined old “Settings” + “Alert Settings”)
     with tab3:
         st.subheader("Background Scheduler & Manual Snapshot")
+        st.write("DEBUG: Entered the Settings tab code.")
 
         if st.button("Start Background Scheduler"):
             start_scheduler()
