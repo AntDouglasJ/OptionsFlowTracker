@@ -8,7 +8,6 @@ import time
 from datetime import datetime
 import threading
 
-# Optional schedule library
 try:
     import schedule
 except ImportError:
@@ -20,12 +19,11 @@ except ImportError:
 st.set_page_config(page_title="Flow & Stock Tracker", layout="wide")
 
 # --------------------------------------------------
-# GLOBALS
+# GLOBALS / SESSION STATE
 # --------------------------------------------------
 DB_NAME = "options_data.db"
 SYMBOLS = ["AAPL", "TSLA", "MSFT", "AMZN", "SPY", "QQQ", "NVDA", "META", "GOOGL"]
 
-# Session state variables
 if "scheduler_running" not in st.session_state:
     st.session_state.scheduler_running = False
 if "refresh_count" not in st.session_state:
@@ -36,6 +34,9 @@ if "alert_ratio" not in st.session_state:
     st.session_state.alert_ratio = 2.0
 if "alert_diff" not in st.session_state:
     st.session_state.alert_diff = 1000
+# New flag for automatically fetching on first page load
+if "initial_fetch_done" not in st.session_state:
+    st.session_state.initial_fetch_done = False
 
 # --------------------------------------------------
 # HELPER: MULTISELECT WITH "ALL"
@@ -99,6 +100,7 @@ def init_db():
         conn.commit()
 
 def store_snapshot(df: pd.DataFrame, snapshot_time: str):
+    """Insert a new snapshot into the DB."""
     if df.empty:
         return
     with sqlite3.connect(DB_NAME) as conn:
@@ -110,6 +112,7 @@ def store_snapshot(df: pd.DataFrame, snapshot_time: str):
         df_to_store.to_sql("options_snapshots", conn, if_exists="append", index=False)
 
 def store_alerts(df_alerts: pd.DataFrame):
+    """Insert triggered alerts into the 'alerts' table."""
     if df_alerts.empty:
         return
     with sqlite3.connect(DB_NAME) as conn:
@@ -163,6 +166,7 @@ def get_latest_snapshot_time():
         return row[0] if row and row[0] else None
 
 def get_snapshot_data(snapshot_time: str):
+    """Get all rows from a specific snapshot_time."""
     query = """
         SELECT symbol AS Symbol,
                type AS Type,
@@ -180,6 +184,7 @@ def get_snapshot_data(snapshot_time: str):
     return df
 
 def get_alert_history(limit=50):
+    """Retrieve the last N alerts from the DB."""
     with sqlite3.connect(DB_NAME) as conn:
         df = pd.read_sql_query(f"SELECT * FROM alerts ORDER BY id DESC LIMIT {limit}", conn)
     return df
@@ -189,8 +194,13 @@ def get_alert_history(limit=50):
 # --------------------------------------------------
 @st.cache_data
 def fetch_options_data(symbols, refresh_count):
+    """
+    Retrieves option chain data for each symbol from Yahoo Finance.
+    The 'refresh_count' param ensures the cache updates if we increment it.
+    """
     import time
     import yfinance as yf
+
     all_rows = []
     for symbol in symbols:
         try:
@@ -260,6 +270,7 @@ def find_unusual_volume(new_df, old_df, ratio_thr, diff_thr):
     return unusual
 
 def handle_unusual_volume(new_data, old_data):
+    """Apply find_unusual_volume with user thresholds, store alerts in DB."""
     ratio_thr = st.session_state.alert_ratio
     diff_thr = st.session_state.alert_diff
     alerts = find_unusual_volume(new_data, old_data, ratio_thr, diff_thr)
@@ -277,6 +288,7 @@ def background_fetch_job():
             fetch_options_data.clear()
             new_df = fetch_options_data(SYMBOLS, st.session_state.refresh_count)
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
             if not new_df.empty:
                 old_time = get_latest_snapshot_time()
                 old_df = pd.DataFrame([])
@@ -289,6 +301,7 @@ def background_fetch_job():
                 print("[Scheduler] Empty snapshot...")
 
             print(f"[Scheduler] Snapshot stored at {now_str}, total rows: {len(new_df)}")
+
         except Exception as e:
             print(f"[Scheduler] error: {e}")
 
@@ -310,15 +323,46 @@ def start_scheduler():
 def page_options_flow():
     st.title("Options Flow Tracker")
 
-    # We have 2 tabs: Flow Data, Alert History
+    # 2 tabs: Flow Data, Alert History
     tab1, tab2 = st.tabs(["Flow Data", "Alert History"])
+
+    # --------------------------------------
+    # 1) AUTO-FETCH if not done once
+    # --------------------------------------
+    if not st.session_state.initial_fetch_done:
+        # Attempt an automatic fetch
+        st.write("Performing initial auto-fetch of options data...")
+
+        fetch_options_data.clear()
+        new_data = fetch_options_data(SYMBOLS, st.session_state.refresh_count)
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if new_data.empty:
+            st.warning("Auto-fetch returned no data. Try again later or go to Settings.")
+        else:
+            old_time = get_latest_snapshot_time()
+            old_df = pd.DataFrame([])
+            if old_time:
+                old_df = get_snapshot_data(old_time)
+
+            store_snapshot(new_data, now_str)
+            st.success(f"Auto-fetch snapshot stored at {now_str}, total rows: {len(new_data)}")
+
+            alerts = handle_unusual_volume(new_data, old_df)
+            if alerts.empty:
+                st.info("No unusual volume found.")
+            else:
+                st.success(f"Detected {len(alerts)} unusual volume rows.")
+
+        # Mark auto-fetch done so we don't do it again every time
+        st.session_state.initial_fetch_done = True
 
     # ---- Tab1: Flow Data
     with tab1:
         st.subheader("Flow Data")
         df_all = get_all_snapshots()
         if df_all.empty:
-            st.info("No snapshots in DB yet. Use 'Settings' page to fetch data.")
+            st.info("No snapshots in DB yet. Data may have been empty or auto-fetch failed.")
             return
 
         st.sidebar.header("Filters")
@@ -378,13 +422,12 @@ def page_stock_chart():
     st.header("Stock Chart & Price (Line or Candlestick)")
     st.markdown("""
     View the price history for a selected symbol.  
-    You can adjust the time period, interval, whether to include after-hours data,  
-    and choose between a **Line** or **Candlestick** chart.
+    Adjust time period, interval, after-hours, and choose a line or candlestick chart.
     """)
 
     st.sidebar.subheader("Filters (Stock Chart)")
 
-    symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=2)  # default "MSFT"
+    symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=2)  # e.g. "MSFT"
     valid_periods = ["1d","5d","1mo","6mo","1y","5y","max"]
     period = st.sidebar.selectbox("Period", valid_periods, index=1)
     valid_intervals = ["1m","5m","15m","30m","1h","1d","1wk","1mo"]
@@ -402,7 +445,7 @@ def page_stock_chart():
 
     df = load_stock_data(symbol, period, interval, after_hours, st.session_state.stock_refresh)
     if df.empty:
-        st.warning(f"No data found for {symbol} using period='{period}' and interval='{interval}'.")
+        st.warning(f"No data for {symbol} with period='{period}' & interval='{interval}'.")
         return
 
     last_price = df["Close"].iloc[-1]
@@ -448,7 +491,7 @@ def page_stock_chart():
         st.session_state.stock_refresh += 1
 
 # --------------------------------------------------
-# PAGE: SETTINGS (Background Scheduler & Alert Settings)
+# PAGE: SETTINGS
 # --------------------------------------------------
 def page_settings():
     st.title("Settings")
@@ -516,7 +559,6 @@ def page_settings():
 def main():
     init_db()
 
-    # Now we have three pages in the sidebar
     pages = ["Options Flow Tracker", "Stock Chart", "Settings"]
     chosen_page = st.sidebar.selectbox("Navigation", pages, index=0)
 
