@@ -1,478 +1,408 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import sqlite3
 import time
-from datetime import datetime
-import threading
+import asyncio
+import aiohttp
+from datetime import datetime, timedelta
+import os
+import json
+from concurrent.futures import ThreadPoolExecutor
+import ssl
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# If you want scheduling:
-try:
-    import schedule
-except ImportError:
-    pass
-
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
-st.set_page_config(
-    page_title="Unusual Options Volume (Multi-Page)",
-    layout="wide"
-)
-
-DB_NAME = "options_data.db"
+# --- Configuration ---
 SYMBOLS = ["AAPL", "TSLA", "MSFT", "AMZN", "SPY", "QQQ", "NVDA", "META", "GOOGL"]
+DATA_FILE = "options_data.json"
+REFRESH_INTERVAL_SEC = 60 * 10  # Refresh data every 10 minutes
+LIVE_PRICE_INTERVAL = 5
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-if "scheduler_running" not in st.session_state:
-    st.session_state.scheduler_running = False
-if "refresh_count" not in st.session_state:
-    st.session_state.refresh_count = 0
+# --- Caching and Data Persistence ---
+price_cache = {}
+options_cache = {}
+last_fetch_time = None
 
-# --------------------------------------------------
-# HELPER: MULTISELECT WITH "ALL"
-# --------------------------------------------------
-def multiselect_with_all(label, options, sidebar=True):
-    """
-    A helper function that shows a multiselect box with an "All" option.
-    If "All" is chosen, returns the full list. Otherwise, returns the chosen subset.
-    """
-    extended_opts = ["All"] + sorted(options)
-    default_val = ["All"]
-    if sidebar:
-        selected = st.sidebar.multiselect(label, extended_opts, default=default_val)
-    else:
-        selected = st.multiselect(label, extended_opts, default=default_val)
 
-    if "All" in selected:
-        return list(options)
-    else:
-        return [x for x in selected if x != "All"]
+def load_data():
+    global options_cache, last_fetch_time
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            try:
+                data = json.load(f)
+                options_cache = data.get("options", {})
+                last_fetch_time = data.get("last_fetch_time")
+            except json.JSONDecodeError:
+                st.error("Error loading cached data. Starting fresh.")
+                options_cache = {}
+                last_fetch_time = None
 
-# --------------------------------------------------
-# 1. DATABASE SETUP
-# --------------------------------------------------
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS options_snapshots (
-                snapshot_time TEXT,
-                symbol TEXT,
-                type TEXT,
-                expiry TEXT,
-                strike REAL,
-                volume REAL,
-                bid REAL,
-                ask REAL,
-                current_price REAL
-            )
-        """)
-        conn.commit()
 
-def store_snapshot(df: pd.DataFrame, snapshot_time: str):
-    if df.empty:
-        return
-    with sqlite3.connect(DB_NAME) as conn:
-        df_to_store = df.copy()
-        df_to_store["snapshot_time"] = snapshot_time
-        df_to_store = df_to_store[
-            [
-                "snapshot_time", "Symbol", "Type", "Expiry",
-                "Strike", "Volume", "Bid", "Ask", "current_price"
-            ]
-        ]
-        df_to_store.to_sql("options_snapshots", conn, if_exists="append", index=False)
+def save_data():
+    def convert_to_serializable(obj):
+        if isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        if isinstance(obj, dict):
+            return {key: convert_to_serializable(value) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        if isinstance(obj, pd.Series):
+            return obj.apply(convert_to_serializable).tolist()
+        return obj
 
-def get_latest_snapshot_time():
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute("SELECT MAX(snapshot_time) FROM options_snapshots")
-        row = c.fetchone()
-        return row[0] if row and row[0] else None
+    serializable_options = convert_to_serializable(options_cache)
+    data = {"options": serializable_options, "last_fetch_time": datetime.now().isoformat()}
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
 
-def get_all_snapshots():
-    query = """
-        SELECT snapshot_time,
-               symbol AS Symbol,
-               type AS Type,
-               expiry AS Expiry,
-               strike AS Strike,
-               volume AS Volume,
-               bid AS Bid,
-               ask AS Ask,
-               current_price AS current_price
-          FROM options_snapshots
-    """
-    with sqlite3.connect(DB_NAME) as conn:
-        df = pd.read_sql_query(query, conn)
-    return df
 
-def get_snapshot_data(snapshot_time: str):
-    query = """
-        SELECT symbol AS Symbol,
-               type AS Type,
-               expiry AS Expiry,
-               strike AS Strike,
-               volume AS Volume,
-               bid AS Bid,
-               ask AS Ask,
-               current_price AS current_price
-          FROM options_snapshots
-         WHERE snapshot_time = ?
-    """
-    with sqlite3.connect(DB_NAME) as conn:
-        df = pd.read_sql_query(query, conn, params=[snapshot_time])
-    return df
+def is_cache_valid():
+    global last_fetch_time
+    if last_fetch_time is None:
+        return False
+    last_fetch_datetime = datetime.fromisoformat(last_fetch_time)
+    return datetime.now() - last_fetch_datetime < timedelta(seconds=REFRESH_INTERVAL_SEC)
 
-# --------------------------------------------------
-# 2. FETCHING / COMPARISON
-# --------------------------------------------------
-@st.cache_data(ttl=300)
-def fetch_options_data(symbols):
-    all_data = []
+
+# --- Live Price Fetching ---
+def fetch_live_price_yf(symbol, error_container):
+    try:
+        ticker = yf.Ticker(symbol)
+        current_price = ticker.info.get('regularMarketPrice', None)
+        return current_price
+    except Exception as e:
+        with error_container:
+            st.error(f"Error fetching live price for {symbol}: {e}")
+        return None
+
+
+def update_prices_in_cache(symbols, error_container):
     for symbol in symbols:
-        try:
-            ticker = yf.Ticker(symbol)
-            current_price = ticker.info.get("regularMarketPrice", None)
-            if current_price is None:
-                hist = ticker.history(period="1d")
-                if not hist.empty:
-                    current_price = hist["Close"].iloc[-1]
+        price = fetch_live_price_yf(symbol, error_container)
+        if price is not None:
+            price_cache[symbol] = price
 
-            if not ticker.options:
-                continue
 
-            for expiry in ticker.options:
-                opt_chain = ticker.option_chain(expiry)
-                for opt_type, chain_df in [("Call", opt_chain.calls), ("Put", opt_chain.puts)]:
-                    for _, row in chain_df.iterrows():
-                        all_data.append({
-                            "Symbol": symbol,
-                            "Type": opt_type,
-                            "Expiry": expiry,
-                            "Strike": row.get("strike", 0),
-                            "Volume": row.get("volume", 0),
-                            "Bid": row.get("bid", 0),
-                            "Ask": row.get("ask", 0),
-                            "current_price": current_price,
-                        })
-            time.sleep(0.2)
-        except Exception as e:
-            st.warning(f"Error fetching data for {symbol}: {e}")
+# --- Option Data Fetching ---
+def fetch_options_for_symbol(symbol, error_container):
+    options_data = []
+    all_expiries = set()
+    try:
+        ticker = yf.Ticker(symbol)
+        current_price = ticker.info.get('regularMarketPrice', None)
+        if current_price is None:
+            history = ticker.history(period="1d")
+            current_price = history['Close'].iloc[-1] if not history.empty else None
 
-    df = pd.DataFrame(all_data)
-    if not df.empty:
-        df.sort_values("Volume", ascending=False, inplace=True)
-    return df
+        price_cache[symbol] = current_price
 
-def find_unusual_volume(new_df, old_df, ratio_thr, diff_thr):
-    if new_df.empty or old_df.empty:
-        return pd.DataFrame([])
+        options = ticker.options
 
-    keys = ["Symbol", "Type", "Expiry", "Strike"]
-    merged = pd.merge(new_df, old_df, on=keys, how="outer", suffixes=("", "_old"))
+        if not options:
+            with error_container:
+                st.warning(f"No options data available for {symbol}")
+                return options_data, all_expiries
 
-    merged["Volume"] = merged["Volume"].fillna(0)
-    merged["Volume_old"] = merged["Volume_old"].fillna(0)
+        for expiry in options:
+            try:
+                all_expiries.add(expiry)
+                if (symbol not in options_cache) or (expiry not in options_cache[symbol]):
+                    opt_chain = ticker.option_chain(expiry)
+                    call_data = opt_chain.calls.to_dict('records') if not opt_chain.calls.empty else []
+                    put_data = opt_chain.puts.to_dict('records') if not opt_chain.puts.empty else []
+                    if symbol not in options_cache:
+                        options_cache[symbol] = {}
+                    options_cache[symbol][expiry] = {"calls": call_data, "puts": put_data}
 
-    merged["Volume_Diff"] = merged["Volume"] - merged["Volume_old"]
-    def ratio_func(row):
-        if row["Volume_old"] > 0:
-            return row["Volume"] / row["Volume_old"]
+                if symbol in options_cache and expiry in options_cache[symbol]:
+                    call_data = options_cache[symbol][expiry].get("calls", [])
+                    put_data = options_cache[symbol][expiry].get("puts", [])
+
+                    for option_type, chain in [("call", call_data), ("put", put_data)]:
+                        for row in chain:
+                            options_data.append({
+                                "Symbol": symbol,
+                                "Current Price": current_price,
+                                "Strike": row['strike'],
+                                "Bid": row['bid'],
+                                "Ask": row['ask'],
+                                "Type": option_type.capitalize(),
+                                "Expiry": expiry,
+                                "Volume": row.get('volume', 0),
+                                "Spread": row['ask'] - row['bid'],
+                            })
+            except Exception as e:
+                with error_container:
+                    st.error(f"Error fetching options for {symbol} at expiry {expiry}: {e}")
+    except Exception as e:
+        with error_container:
+            st.error(f"Error fetching data for {symbol}: {e}")
+        return [], set()
+    return options_data, all_expiries
+
+
+def fetch_options_data(symbols, error_container):
+    global options_cache
+    all_expiries = set()
+    all_options_data = []
+
+    with ThreadPoolExecutor() as executor:
+        results = executor.map(lambda symbol: fetch_options_for_symbol(symbol, error_container), symbols)
+        for options_data, expiries in results:
+            all_options_data.extend(options_data)
+            all_expiries.update(expiries)
+    return pd.DataFrame(all_options_data), sorted(list(all_expiries))
+
+def create_candlestick_chart(symbol, chart_placeholder, timeframe="3mo", include_after_hours=False):
+    try:
+        ticker = yf.Ticker(symbol)
+        history_data = ticker.history(period=timeframe, prepost = include_after_hours)
+        if not history_data.empty:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                               row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=history_data.index,
+                                         open=history_data['Open'],
+                                         high=history_data['High'],
+                                         low=history_data['Low'],
+                                         close=history_data['Close'],
+                                         name='Candlestick'), row=1, col=1)
+            fig.add_trace(go.Bar(x=history_data.index,
+                                y=history_data['Volume'],
+                                marker_color='rgba(150,150,150,0.6)',
+                                name='Volume'), row=2, col=1)
+            fig.update_layout(title=f"{symbol} Price and Volume Chart",
+                              xaxis_rangeslider_visible=False)
+            fig.update_xaxes(title_text='Date', row=1, col=1)
+            fig.update_xaxes(title_text='Date', row=2, col=1)
+            fig.update_yaxes(title_text='Price', row=1, col=1)
+            fig.update_yaxes(title_text='Volume', row=2, col=1)
+
+            with chart_placeholder:
+                st.plotly_chart(fig, use_container_width=True)
         else:
-            return float("inf")
-    merged["Volume_Ratio"] = merged.apply(ratio_func, axis=1)
+            with chart_placeholder:
+                st.warning(f"No historical data available for {symbol}")
+    except Exception as e:
+        with chart_placeholder:
+            st.error(f"Error generating chart for {symbol}: {e}")
 
-    condition = (
-        (merged["Volume_Ratio"] >= ratio_thr) &
-        (merged["Volume_Diff"] >= diff_thr)
-    )
-    unusual = merged[condition].copy()
 
-    if unusual.empty:
-        return unusual
+# --- Streamlit UI ---
 
-    keep_cols = [
-        "Symbol", "Type", "Expiry", "Strike",
-        "Volume_old", "Volume", "Volume_Diff", "Volume_Ratio",
-        "Bid", "Ask", "current_price"
-    ]
-    existing_cols = [c for c in keep_cols if c in unusual.columns]
-    unusual = unusual[condition][existing_cols].sort_values("Volume_Diff", ascending=False)
-    return unusual
+# Set up page navigation
+st.set_page_config(page_title="Options Flow Tracker", layout="wide")
 
-# --------------------------------------------------
-# 3. ALERTS
-# --------------------------------------------------
-def send_alerts(unusual_df):
-    if unusual_df.empty:
-        print("[ALERT] No unusual volume found.")
-        return
-    print("[ALERT] Unusual volume detected!")
-    limited = unusual_df.head(5)
-    print(limited.to_string(index=False))
+page = st.sidebar.selectbox("Navigation", ["Options Table", "Stock Chart"])
 
-# --------------------------------------------------
-# 4. BACKGROUND SCHEDULER
-# --------------------------------------------------
-def background_fetch_job():
-    while True:
-        interval_minutes = 1
-        try:
-            fetch_options_data.clear()
-            new_snapshot_df = fetch_options_data(SYMBOLS)
 
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if not new_snapshot_df.empty:
-                old_time = get_latest_snapshot_time()
-                old_df = pd.DataFrame([])
-                if old_time:
-                    old_df = get_snapshot_data(old_time)
-
-                store_snapshot(new_snapshot_df, now_str)
-
-                ratio_thr = 2.0
-                diff_thr = 1000
-                unusual_df = find_unusual_volume(new_snapshot_df, old_df, ratio_thr, diff_thr)
-                if not unusual_df.empty:
-                    send_alerts(unusual_df)
-
-                print(f"[Scheduler] Snapshot stored at {now_str}, {len(new_snapshot_df)} rows.")
-            else:
-                print("[Scheduler] Empty new snapshot. No data to store.")
-
-        except Exception as ex:
-            print(f"[Scheduler] Error: {ex}")
-
-        for _ in range(interval_minutes * 6):
-            time.sleep(10)
-
-def start_scheduler():
-    if st.session_state.scheduler_running:
-        st.write("Scheduler is already running.")
-        return
-    st.session_state.scheduler_running = True
-    thread = threading.Thread(target=background_fetch_job, daemon=True)
-    thread.start()
-    st.write("Background scheduler thread started.")
-
-# --------------------------------------------------
-# PAGE 1: Options Flow Tracker
-# --------------------------------------------------
-def page_options_flow():
+if page == "Options Table":
     st.title("Options Flow Tracker")
+    # --- Sidebar ---
+    st.sidebar.header("Filters")
 
-    # Create two tabs within this page: "Flow Data" and "Settings"
-    tab1, tab2 = st.tabs(["Flow Data", "Settings"])
+    load_data()
 
-    with tab1:
-        st.subheader("Filtered Options Data")
+    # Create an error container in the UI
+    error_container = st.empty()
 
-        # --- Load all snapshots ---
-        df_all = get_all_snapshots()
-        if df_all.empty:
-            st.info("No snapshots in DB yet. Go to 'Settings' tab to fetch data.")
-            return
-
-        df_all.sort_values("snapshot_time", inplace=True)
-
-        st.sidebar.header("Filters")
-        # Symbol
-        unique_symbols = df_all["Symbol"].unique()
-        selected_symbols = multiselect_with_all("Symbols", unique_symbols)
-        # Type
-        unique_types = df_all["Type"].unique()
-        selected_types = multiselect_with_all("Option Types", unique_types)
-        # Expiry
-        unique_expiries = df_all["Expiry"].unique()
-        selected_expiries = multiselect_with_all("Expiries", unique_expiries)
-        # Strike
-        unique_strikes = df_all["Strike"].unique().astype(str)
-        selected_strikes = multiselect_with_all("Strikes", unique_strikes)
-
-        filtered = df_all[
-            df_all["Symbol"].isin(selected_symbols) &
-            df_all["Type"].isin(selected_types) &
-            df_all["Expiry"].isin(selected_expiries)
-        ].copy()
-        filtered["Strike_str"] = filtered["Strike"].astype(str)
-        filtered = filtered[filtered["Strike_str"].isin(selected_strikes)]
-
-        if filtered.empty:
-            st.warning("No data matching the selected filters.")
-        else:
-            # Remove duplicates
-            filtered.drop_duplicates(
-                subset=["Symbol","Type","Expiry","Strike","Volume","Bid","Ask","current_price"],
-                inplace=True
-            )
-            # Sort by Volume desc
-            filtered = filtered.sort_values("Volume", ascending=False)
-
-            # Reorder columns
-            filtered.rename(columns={"Expiry":"Expiry Date"}, inplace=True)
-            final_cols = [
-                "Symbol",
-                "current_price",
-                "Strike",
-                "Bid",
-                "Ask",
-                "Type",
-                "Expiry Date",
-                "Volume"
-            ]
-            existing_cols = [c for c in final_cols if c in filtered.columns]
-            display_df = filtered[existing_cols].copy()
-            display_df.rename(columns={"current_price":"Current Price"}, inplace=True)
-            display_df.drop(columns=["Strike_str"], errors="ignore", inplace=True)
-
-            st.dataframe(display_df.reset_index(drop=True))
-
-    with tab2:
-        # This is the old "Settings" page content
-        st.subheader("Scheduler Controls")
-        if st.button("Start Background Scheduler"):
-            start_scheduler()
-
-        st.subheader("Manual Snapshot Fetch")
-        if st.button("Fetch Snapshot Now"):
-            fetch_options_data.clear()
-            new_snapshot = fetch_options_data(SYMBOLS)
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            if new_snapshot.empty:
-                st.warning("No data returned from Yahoo.")
-            else:
-                old_time = get_latest_snapshot_time()
-                old_df = pd.DataFrame([])
-                if old_time:
-                    old_df = get_snapshot_data(old_time)
-
-                store_snapshot(new_snapshot, now_str)
-                st.success(f"Snapshot stored at {now_str}, {len(new_snapshot)} rows.")
-
-                ratio_thr = 2.0
-                diff_thr = 1000
-                unusual_df = find_unusual_volume(new_snapshot, old_df, ratio_thr, diff_thr)
-                if unusual_df.empty:
-                    st.info("No unusual volume found.")
-                else:
-                    st.success(f"Detected {len(unusual_df)} unusual volume rows.")
-                    st.dataframe(unusual_df)
-
-                send_alerts(unusual_df)
-
-        st.write("---")
-        st.write(f"**Refresh Count (session):** {st.session_state.refresh_count}")
-        if st.session_state.scheduler_running:
-            st.info("Background scheduler is running in a separate thread.")
-
-# --------------------------------------------------
-# PAGE 2: Stock Chart
-# --------------------------------------------------
-@st.cache_data
-def load_stock_data(symbol, period, interval, after_hours, refresh_counter):
-    """
-    The combination of these arguments forms the cache key.
-    Changing any => re-fetch from yfinance.
-    """
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period, interval=interval, prepost=after_hours)
-    return df
-
-@st.cache_data(ttl=300)
-def fetch_stock_history(symbol, period, interval, after_hours):
-    ticker = yf.Ticker(symbol)
-    return ticker.history(period=period, interval=interval, prepost=after_hours)
-
-def page_stock_chart():
-    if "stock_refresh" not in st.session_state:
-        st.session_state["stock_refresh"] = 0
-
-    SYMBOLS = ["AAPL","MSFT","TSLA","SPY","QQQ"]
-    PERIODS = ["1d","5d","1mo","6mo","1y","5y","max"]
-    INTERVALS = ["1m","5m","15m","30m","1h","1d","1wk","1mo"]
-
-    st.sidebar.header("Filters (Stock Chart)")
-    symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=1)  # e.g. "MSFT"
-    period = st.sidebar.selectbox("Period", PERIODS, index=3)  # e.g. "1d"
-    interval = st.sidebar.selectbox("Interval", INTERVALS, index=2)  # e.g. "15m"
-    after_hours = st.sidebar.checkbox("Include After-Hours Data?", value=False)
-    chart_type = st.sidebar.radio("Chart Type", ["Line","Candlestick"], index=1)
-
-    # Refresh
-    if st.sidebar.button("Refresh Now"):
-        st.session_state["stock_refresh"] += 1
-
-    auto_refresh = st.sidebar.checkbox("Auto-refresh every 15 seconds", value=False)
-
-    # Clear cache button
-    if st.sidebar.button("Clear Cache"):
-        load_stock_data.clear()
-
-    # Fetch data
-    if symbol:
-        with st.spinner("Loading stock chart..."):
-            df = load_stock_data(symbol, period, interval, after_hours, st.session_state["stock_refresh"])
-
-        if df.empty:
-            st.warning(f"No price data found for {symbol}.")
-        else:
-            st.header("Stock Chart & Price (Line or Candlestick)")
-            st.write(f"**Symbol**: {symbol}, **Last Price**: {df['Close'].iloc[-1]:.2f}")
-            # Build chart
-            fig = go.Figure()
-            if chart_type == "Line":
-                fig.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines", name="Close"))
-            else:
-                fig.add_trace(
-                    go.Candlestick(
-                        x=df.index,
-                        open=df["Open"],
-                        high=df["High"],
-                        low=df["Low"],
-                        close=df["Close"],
-                        name=symbol
-                    )
-                )
-
-            fig.update_layout(
-                title=f"{symbol} - {period} ({interval})",
-                xaxis_title="Date",
-                yaxis_title="Price",
-                hovermode="x unified"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.dataframe(df.tail(10))
-
-    if auto_refresh:
-        time.sleep(15)
-        st.session_state["stock_refresh"] += 1
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
-def main():
-    init_db()
-
-    # Two pages in the sidebar:
-    # 1) "Options Flow Tracker"
-    # 2) "Stock Chart"
-    pages = ["Options Flow Tracker", "Stock Chart"]
-    chosen_page = st.sidebar.selectbox("Navigation", pages, index=0)
-
-    if chosen_page == "Options Flow Tracker":
-        page_options_flow()
+    # Fetch Data if Cache is invalid or if button is clicked
+    if not is_cache_valid():
+        with st.spinner("Fetching initial options data..."):
+            data, all_expiries = fetch_options_data(SYMBOLS, error_container)
+            save_data()
+            error_container.empty()
     else:
-        page_stock_chart()
+        with st.spinner("Loading from cache..."):
+            data, all_expiries = fetch_options_data(SYMBOLS, error_container)  # This loads from cache
+            error_container.empty()
 
-    # If you want any common footer info:
-    st.write("---")
-    st.write(f"**Refresh Count (session):** {st.session_state.refresh_count}")
-    if st.session_state.scheduler_running:
-        st.info("Background scheduler is running in a separate thread.")
+    # Update prices in background
+    update_prices_in_cache(SYMBOLS, error_container)
 
-if __name__ == "__main__":
-    main()
+    # Dropdowns
+    unique_symbols = sorted(data["Symbol"].unique()) if not data.empty else []
+    selected_symbol = st.sidebar.selectbox("Symbol", ["All"] + unique_symbols)
+    selected_type = st.sidebar.selectbox("Option Type", ["All", "Call", "Put"])
+    selected_expiry = st.sidebar.selectbox("Expiry Date (YYYY-MM-DD)", ["All"] + all_expiries)
+
+    # Add "In the Money" filter
+    in_out_options = ["All", "In the Money", "Out of the Money"]
+    selected_in_out = st.sidebar.selectbox("In/Out of the Money", in_out_options)
+
+    # Filter controls
+    st.sidebar.subheader("Filter Ranges")
+    min_strike, max_strike = st.sidebar.slider("Strike Price Range", min_value=0.0, max_value=max(data['Strike'], default=1000) * 2,
+                                            value=(0.0, max(data['Strike'], default=1000) * 2), step=1.0)
+    max_volume_val = max(data['Volume'], default=10000)
+    min_volume, max_volume = st.sidebar.slider("Volume Range", min_value=0, max_value=int(max_volume_val),
+                                            value=(0, int(max_volume_val)), step=10)
+
+    # Add Bid/Ask filters
+    st.sidebar.subheader("Bid/Ask Filter Ranges")
+    min_bid, max_bid = st.sidebar.slider("Bid Range", min_value=0.0, max_value=max(data['Bid'], default=100) * 2,
+                                       value=(0.0, max(data['Bid'], default=100) * 2), step=0.1)
+    min_ask, max_ask = st.sidebar.slider("Ask Range", min_value=0.0, max_value=max(data['Ask'], default=100) * 2,
+                                       value=(0.0, max(data['Ask'], default=100) * 2), step=0.1)
+
+    # Auto-refresh checkbox
+    auto_refresh = st.sidebar.checkbox("Auto-refresh every 10 seconds")
+
+    # Initialize placeholder for the table
+    table_placeholder = st.empty()
+
+
+    # --- Data Updating and Display ---
+
+    def get_in_the_money_filter(data, symbol, current_price):
+        def inner_filter(row):
+            if symbol == "All" or not current_price:
+                return True
+            if row["Type"] == "Call":
+                return current_price > row["Strike"]
+            else:
+                return current_price < row["Strike"]
+
+        return inner_filter
+
+
+    def format_price(price):
+        return f"{price:.2f}" if price is not None else "N/A"
+
+    def update_data(error_container):
+        filtered_data = data.copy()
+
+        # Apply filters
+        if selected_symbol != "All":
+            filtered_data = filtered_data[filtered_data['Symbol'] == selected_symbol]
+        if selected_type != "All":
+            filtered_data = filtered_data[filtered_data['Type'] == selected_type]
+        if selected_expiry != "All":
+            filtered_data = filtered_data[filtered_data['Expiry'] == selected_expiry]
+        filtered_data = filtered_data[(filtered_data["Strike"] >= min_strike) & (filtered_data["Strike"] <= max_strike)]
+        filtered_data = filtered_data[(filtered_data["Volume"] >= min_volume) & (filtered_data["Volume"] <= max_volume)]
+        filtered_data = filtered_data[(filtered_data["Bid"] >= min_bid) & (filtered_data["Bid"] <= max_bid)]
+        filtered_data = filtered_data[(filtered_data["Ask"] >= min_ask) & (filtered_data["Ask"] <= max_ask)]
+
+        filtered_data['In the Money'] = filtered_data.apply(
+            lambda row: "Yes" if get_in_the_money_filter(filtered_data, row["Symbol"], price_cache.get(row["Symbol"]))(
+                row) else "No", axis=1)
+
+        filtered_data["Current Price"] = filtered_data["Symbol"].apply(
+            lambda symbol: format_price(price_cache.get(symbol)) if price_cache.get(symbol) else "N/A")
+
+        # Filter by "In/Out of the Money" selection
+        if selected_in_out != "All":
+            if selected_in_out == "In the Money":
+                filtered_data = filtered_data[filtered_data['In the Money'] == "Yes"]
+            elif selected_in_out == "Out of the Money":
+                filtered_data = filtered_data[filtered_data['In the Money'] == "No"]
+
+        # Sort data by Volume in descending order
+        if not filtered_data.empty:
+            filtered_data = filtered_data.sort_values(by="Volume", ascending=False)
+
+        # Display data
+        if not filtered_data.empty:
+            with table_placeholder.container():
+                st.dataframe(filtered_data.reset_index(drop=True),
+                            column_config={
+                            "Bid": st.column_config.NumberColumn(format="%.2f"),
+                            "Ask": st.column_config.NumberColumn(format="%.2f"),
+                            "Spread": st.column_config.NumberColumn(format="%.2f")
+                            },
+                            use_container_width=True)
+            error_container.empty()
+        else:
+            with table_placeholder.container():
+                st.warning("No data available with the selected filters.")
+
+        return filtered_data
+
+    # Initial data load
+    update_data(error_container)
+
+    # Auto-refresh loop
+    if auto_refresh:
+        while True:
+            with st.spinner("Updating prices and data..."):
+                update_prices_in_cache(SYMBOLS, error_container)
+                update_data(error_container)
+            time.sleep(10)
+            error_container.empty()
+
+    # Refresh button if auto-refresh is not selected
+    if not auto_refresh:
+        if st.sidebar.button("Refresh Now"):
+            with st.spinner("Fetching data..."):
+                update_prices_in_cache(SYMBOLS, error_container)
+                update_data(error_container)
+            error_container.empty()
+
+    # Periodic price updates
+    if not auto_refresh:
+        if "last_price_update" not in st.session_state:
+            st.session_state["last_price_update"] = datetime.now()
+
+        if (datetime.now() - st.session_state["last_price_update"]).total_seconds() >= LIVE_PRICE_INTERVAL:
+            with st.spinner("Updating prices..."):
+                update_prices_in_cache(SYMBOLS, error_container)
+                update_data(error_container)
+                st.session_state["last_price_update"] = datetime.now()
+            error_container.empty()
+
+
+elif page == "Stock Chart":
+     st.title("Stock Chart")
+     # --- Sidebar ---
+     st.sidebar.header("Chart Options")
+
+     # Load Data
+     load_data()
+     error_container = st.empty()
+
+     if not is_cache_valid():
+        with st.spinner("Fetching initial options data..."):
+            data, all_expiries = fetch_options_data(SYMBOLS, error_container)
+            save_data()
+            error_container.empty()
+     else:
+        with st.spinner("Loading from cache..."):
+            data, all_expiries = fetch_options_data(SYMBOLS, error_container)
+            error_container.empty()
+
+     # Update prices in background
+     update_prices_in_cache(SYMBOLS, error_container)
+
+     # Dropdowns
+     unique_symbols = sorted(data["Symbol"].unique()) if not data.empty else []
+     selected_chart_symbol = st.sidebar.selectbox("Select Stock Symbol",  unique_symbols)
+
+     time_frames = {
+          "1 Minute": "1m",
+          "5 Minutes": "5m",
+          "15 Minutes": "15m",
+          "1 Day": "1d",
+          "5 Days": "5d",
+          "1 Month": "1mo",
+          "3 Months": "3mo",
+          "6 Months": "6mo",
+          "1 Year": "1y",
+          "2 Year": "2y",
+          "5 Year": "5y",
+          "Max": "max"
+      }
+
+     selected_timeframe = st.sidebar.selectbox("Select Time Frame", list(time_frames.keys()))
+     selected_timeframe_value = time_frames[selected_timeframe]
+
+     include_after_hours = st.sidebar.checkbox("Include After-Hours Data")
+
+     if selected_chart_symbol:
+       chart_placeholder = st.empty()
+       current_price = price_cache.get(selected_chart_symbol)
+       st.markdown(f"<h1 style='text-align: center;'>{current_price:.2f}</h1>", unsafe_allow_html=True)
+
+       create_candlestick_chart(selected_chart_symbol, chart_placeholder, selected_timeframe_value, include_after_hours)
+     else:
+       st.warning("Please select a stock to display")
