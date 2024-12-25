@@ -25,7 +25,7 @@ st.set_page_config(page_title="Flow & Stock Tracker", layout="wide")
 DB_NAME = "options_data.db"
 SYMBOLS = ["AAPL", "TSLA", "MSFT", "AMZN", "SPY", "QQQ", "NVDA", "META", "GOOGL"]
 
-# Initialize session state variables
+# Session state variables
 if "scheduler_running" not in st.session_state:
     st.session_state.scheduler_running = False
 if "refresh_count" not in st.session_state:
@@ -57,7 +57,6 @@ def multiselect_with_all(label, options, sidebar=True):
         return list(options)
     else:
         return [x for x in selection if x != "All"]
-
 
 # --------------------------------------------------
 # 1. DATABASE SETUP
@@ -306,34 +305,26 @@ def start_scheduler():
     st.write("Background scheduler thread started.")
 
 # --------------------------------------------------
-# PAGE 1: OPTIONS FLOW TRACKER
+# PAGE: OPTIONS FLOW TRACKER
 # --------------------------------------------------
 def page_options_flow():
     st.title("Options Flow Tracker")
 
-    # We have 3 tabs in this order:
-    # 1) Flow Data
-    # 2) Alert History
-    # 3) Settings (includes old 'Settings' + 'Alert Settings')
-
-    tab1, tab2, tab3 = st.tabs(["Flow Data", "Alert History", "Settings"])
+    # We have 2 tabs: Flow Data, Alert History
+    tab1, tab2 = st.tabs(["Flow Data", "Alert History"])
 
     # ---- Tab1: Flow Data
     with tab1:
         st.subheader("Flow Data")
         df_all = get_all_snapshots()
         if df_all.empty:
-            st.info("No snapshots in DB yet. Go to the 'Settings' tab to fetch data.")
+            st.info("No snapshots in DB yet. Use 'Settings' page to fetch data.")
             return
 
         st.sidebar.header("Filters")
-        # Symbol
         syms = multiselect_with_all("Symbols", df_all["Symbol"].unique())
-        # Type
         types = multiselect_with_all("Option Types", df_all["Type"].unique())
-        # Expiry
         exps = multiselect_with_all("Expiries", df_all["Expiry"].unique())
-        # Strike
         all_strikes = df_all["Strike"].unique().astype(str)
         chosen_strikes = multiselect_with_all("Strikes", all_strikes)
 
@@ -342,7 +333,6 @@ def page_options_flow():
             df_all["Type"].isin(types) &
             df_all["Expiry"].isin(exps)
         ].copy()
-
         filtered["Strike_str"] = filtered["Strike"].astype(str)
         filtered = filtered[filtered["Strike_str"].isin(chosen_strikes)]
 
@@ -365,60 +355,6 @@ def page_options_flow():
             disp.drop(columns=["Strike_str"], errors="ignore", inplace=True)
 
             st.dataframe(disp.reset_index(drop=True))
-            
-        st.subheader("Background Scheduler & Manual Snapshot")
-        st.write("DEBUG: Entered the Settings tab code.")
-
-        if st.button("Start Background Scheduler"):
-            start_scheduler()
-
-        if st.button("Fetch Snapshot Now"):
-            fetch_options_data.clear()
-            new_data = fetch_options_data(SYMBOLS, st.session_state.refresh_count)
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            if new_data.empty:
-                st.warning("No data returned.")
-            else:
-                old_time = get_latest_snapshot_time()
-                old_df = pd.DataFrame([])
-                if old_time:
-                    old_df = get_snapshot_data(old_time)
-
-                store_snapshot(new_data, now_str)
-                st.success(f"Snapshot stored at {now_str}, total rows: {len(new_data)}")
-
-                # Check for unusual volume => alerts
-                alerts = handle_unusual_volume(new_data, old_df)
-                if alerts.empty:
-                    st.info("No unusual volume found.")
-                else:
-                    st.success(f"Detected {len(alerts)} unusual volume rows.")
-                    st.dataframe(alerts)
-
-        if st.button("Clear Cache"):
-            fetch_options_data.clear()
-            st.success("Options data cache cleared.")
-
-        st.write("---")
-        st.write("**Alert Settings**")
-        ratio_val = st.number_input("Volume Ratio Threshold (e.g. 2 = 2x)",
-                                    min_value=1.0, value=st.session_state.alert_ratio, step=0.5)
-        diff_val = st.number_input("Absolute Volume Increase Threshold",
-                                   min_value=1, value=st.session_state.alert_diff, step=100)
-
-        if st.button("Save Alert Settings"):
-            st.session_state.alert_ratio = ratio_val
-            st.session_state.alert_diff = diff_val
-            st.success(f"Saved ratio={ratio_val} diff={diff_val}")
-
-        st.write(f"**Current Ratio**: {st.session_state.alert_ratio}, "
-                 f"**Current Diff**: {st.session_state.alert_diff}")
-
-        st.write("---")
-        st.write(f"**Refresh Count (session)**: {st.session_state.refresh_count}")
-        if st.session_state.scheduler_running:
-            st.info("Background scheduler is running in a separate thread.")
 
     # ---- Tab2: Alert History
     with tab2:
@@ -429,64 +365,8 @@ def page_options_flow():
         else:
             st.dataframe(df_alerts)
 
-    # ---- Tab3: Settings (combined old “Settings” + “Alert Settings”)
-    with tab3:
-        st.subheader("Background Scheduler & Manual Snapshot")
-        st.write("DEBUG: Entered the Settings tab code.")
-
-        if st.button("Start Background Scheduler"):
-            start_scheduler()
-
-        if st.button("Fetch Snapshot Now"):
-            fetch_options_data.clear()
-            new_data = fetch_options_data(SYMBOLS, st.session_state.refresh_count)
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            if new_data.empty:
-                st.warning("No data returned.")
-            else:
-                old_time = get_latest_snapshot_time()
-                old_df = pd.DataFrame([])
-                if old_time:
-                    old_df = get_snapshot_data(old_time)
-
-                store_snapshot(new_data, now_str)
-                st.success(f"Snapshot stored at {now_str}, total rows: {len(new_data)}")
-
-                # Check for unusual volume => alerts
-                alerts = handle_unusual_volume(new_data, old_df)
-                if alerts.empty:
-                    st.info("No unusual volume found.")
-                else:
-                    st.success(f"Detected {len(alerts)} unusual volume rows.")
-                    st.dataframe(alerts)
-
-        if st.button("Clear Cache"):
-            fetch_options_data.clear()
-            st.success("Options data cache cleared.")
-
-        st.write("---")
-        st.write("**Alert Settings**")
-        ratio_val = st.number_input("Volume Ratio Threshold (e.g. 2 = 2x)",
-                                    min_value=1.0, value=st.session_state.alert_ratio, step=0.5)
-        diff_val = st.number_input("Absolute Volume Increase Threshold",
-                                   min_value=1, value=st.session_state.alert_diff, step=100)
-
-        if st.button("Save Alert Settings"):
-            st.session_state.alert_ratio = ratio_val
-            st.session_state.alert_diff = diff_val
-            st.success(f"Saved ratio={ratio_val} diff={diff_val}")
-
-        st.write(f"**Current Ratio**: {st.session_state.alert_ratio}, "
-                 f"**Current Diff**: {st.session_state.alert_diff}")
-
-        st.write("---")
-        st.write(f"**Refresh Count (session)**: {st.session_state.refresh_count}")
-        if st.session_state.scheduler_running:
-            st.info("Background scheduler is running in a separate thread.")
-
 # --------------------------------------------------
-# PAGE 2: STOCK CHART
+# PAGE: STOCK CHART
 # --------------------------------------------------
 @st.cache_data
 def load_stock_data(symbol, period, interval, after_hours, refresh_counter):
@@ -516,13 +396,11 @@ def page_stock_chart():
         st.session_state.stock_refresh += 1
 
     auto_refresh = st.sidebar.checkbox("Auto-refresh every 15 seconds", value=False)
-
     if st.sidebar.button("Clear Cache"):
         load_stock_data.clear()
         st.success("Stock data cache cleared.")
 
     df = load_stock_data(symbol, period, interval, after_hours, st.session_state.stock_refresh)
-
     if df.empty:
         st.warning(f"No data found for {symbol} using period='{period}' and interval='{interval}'.")
         return
@@ -570,18 +448,84 @@ def page_stock_chart():
         st.session_state.stock_refresh += 1
 
 # --------------------------------------------------
+# PAGE: SETTINGS (Background Scheduler & Alert Settings)
+# --------------------------------------------------
+def page_settings():
+    st.title("Settings")
+
+    st.subheader("Background Scheduler & Manual Snapshot")
+    if st.button("Start Background Scheduler"):
+        start_scheduler()
+
+    if st.button("Fetch Snapshot Now"):
+        fetch_options_data.clear()
+        new_data = fetch_options_data(SYMBOLS, st.session_state.refresh_count)
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if new_data.empty:
+            st.warning("No data returned.")
+        else:
+            old_time = get_latest_snapshot_time()
+            old_df = pd.DataFrame([])
+            if old_time:
+                old_df = get_snapshot_data(old_time)
+
+            store_snapshot(new_data, now_str)
+            st.success(f"Snapshot stored at {now_str}, total rows: {len(new_data)}")
+
+            alerts = handle_unusual_volume(new_data, old_df)
+            if alerts.empty:
+                st.info("No unusual volume found.")
+            else:
+                st.success(f"Detected {len(alerts)} unusual volume rows.")
+                st.dataframe(alerts)
+
+    if st.button("Clear Cache"):
+        fetch_options_data.clear()
+        st.success("Options data cache cleared.")
+
+    st.write("---")
+    st.subheader("Alert Settings")
+    ratio_val = st.number_input(
+        "Volume Ratio Threshold (e.g. 2 = 2x)",
+        min_value=1.0,
+        value=st.session_state.alert_ratio,
+        step=0.5
+    )
+    diff_val = st.number_input(
+        "Absolute Volume Increase Threshold",
+        min_value=1,
+        value=st.session_state.alert_diff,
+        step=100
+    )
+
+    if st.button("Save Alert Settings"):
+        st.session_state.alert_ratio = ratio_val
+        st.session_state.alert_diff = diff_val
+        st.success(f"Saved ratio={ratio_val} diff={diff_val}")
+
+    st.write(f"**Current Ratio**: {st.session_state.alert_ratio}, **Current Diff**: {st.session_state.alert_diff}")
+    st.write("---")
+    st.write(f"**Refresh Count (session)**: {st.session_state.refresh_count}")
+    if st.session_state.scheduler_running:
+        st.info("Background scheduler is running in a separate thread.")
+
+# --------------------------------------------------
 # MAIN
 # --------------------------------------------------
 def main():
     init_db()
 
-    pages = ["Options Flow Tracker", "Stock Chart"]
+    # Now we have three pages in the sidebar
+    pages = ["Options Flow Tracker", "Stock Chart", "Settings"]
     chosen_page = st.sidebar.selectbox("Navigation", pages, index=0)
 
     if chosen_page == "Options Flow Tracker":
         page_options_flow()
-    else:
+    elif chosen_page == "Stock Chart":
         page_stock_chart()
+    else:
+        page_settings()
 
     st.write("---")
     st.write(f"**Refresh Count (session):** {st.session_state.refresh_count}")
