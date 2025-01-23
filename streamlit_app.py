@@ -37,7 +37,7 @@ if "stock_refresh" not in st.session_state:
 if "alert_ratio" not in st.session_state:
     st.session_state.alert_ratio = 2.0
 if "alert_diff" not in st.session_state:
-    st.session_state.alert_diff = 1000
+    st.session_state.alert_diff = 5000
 # New flag for automatically fetching on first page load
 if "initial_fetch_done" not in st.session_state:
     st.session_state.initial_fetch_done = False
